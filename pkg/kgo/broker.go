@@ -366,6 +366,11 @@ func (b *broker) handleReq(pr promisedReq) {
 		noResp.Version = req.GetVersion()
 	}
 
+	switch req.(type) {
+	case *produceRequest, *kmsg.ProduceRequest:
+		b.cl.producer.txnRollMu.RLock()
+		defer b.cl.producer.txnRollMu.RUnlock()
+	}
 	corrID, bytesWritten, writeErr, writeWait, timeToWrite, readEnqueue := cxn.writeRequest(pr.ctx, pr.enqueue, req)
 
 	if writeErr != nil {

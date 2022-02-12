@@ -592,6 +592,93 @@ func (cl *Client) EndTransaction(ctx context.Context, commit TransactionEndTry) 
 	return err
 }
 
+// EndBeginTransaction can be used where the producer wants to atomically
+// end the current transaction and immediately start a new one for the
+// provided topics and partitions. Warning: if the producer writes to any
+// partition not provided to this function they may be written outside the
+// transactional context and will be ignored by transactional consumers.
+// Using this function should generally result in better performance since
+// it doesn't require calling Flush or blocking any concurrent calls to Produce.
+func (cl *Client) EndBeginTransaction(ctx context.Context, commit TransactionEndTry, newTxnPartitions []kmsg.AddPartitionsToTxnRequestTopic) error {
+	cl.producer.txnMu.Lock()
+	defer cl.producer.txnMu.Unlock()
+
+	if !cl.producer.inTxn {
+		return errNotInTransaction
+	}
+
+	id, epoch, err := cl.producerID()
+	if err != nil {
+		if commit {
+			return kerr.OperationNotAttempted
+		}
+
+		// If we recovered the producer ID, we return early, since
+		// there is no reason to issue an abort now that the id is
+		// different. Otherwise, we issue our EndTxn which will likely
+		// fail, but that is ok, we will just return error.
+		_, didRecover, _ := cl.maybeRecoverProducerID()
+		if didRecover {
+			return nil
+		}
+	}
+
+	cl.producer.txnRollMu.Lock()
+	defer cl.producer.txnRollMu.Unlock()
+
+	err = cl.doWithConcurrentTransactions("EndTxn", func() error {
+		req := kmsg.NewPtrEndTxnRequest()
+		req.TransactionalID = *cl.cfg.txnID
+		req.ProducerID = id
+		req.ProducerEpoch = epoch
+		req.Commit = bool(commit)
+		resp, err := req.RequestWith(ctx, cl)
+		if err != nil {
+			return err
+		}
+		return kerr.ErrorForCode(resp.ErrorCode)
+	})
+
+	// If the returned error is still a Kafka error, this is fatal and we
+	// need to fail our producer ID we loaded above.
+	var ke *kerr.Error
+	if errors.As(err, &ke) && !ke.Retriable {
+		cl.failProducerID(id, epoch, err)
+	}
+	if err != nil {
+		return err
+	}
+
+	err = cl.doWithConcurrentTransactions("AddPartitionsToTxn", func() error {
+		req := &kmsg.AddPartitionsToTxnRequest{
+			Version:         3,
+			TransactionalID: *cl.cfg.txnID,
+			ProducerID:      id,
+			ProducerEpoch:   epoch,
+			Topics:          newTxnPartitions,
+		}
+		resp, err := req.RequestWith(cl.ctx, cl)
+		if err != nil {
+			return err
+		}
+		for _, topic := range resp.Topics {
+			for _, partition := range topic.Partitions {
+				if partition.ErrorCode != 0 {
+					return kerr.ErrorForCode(partition.ErrorCode)
+				}
+			}
+		}
+		return nil
+	})
+
+	// If the returned error is still a Kafka error, this is fatal and we
+	// need to fail our producer ID we loaded above.
+	if errors.As(err, &ke) && !ke.Retriable {
+		cl.failProducerID(id, epoch, err)
+	}
+	return err
+}
+
 // This returns if it is necessary to recover the producer ID (it has an
 // error), whether it is possible to recover, and, if not, the error.
 //

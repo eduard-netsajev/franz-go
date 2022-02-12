@@ -52,6 +52,12 @@ type producer struct {
 
 	txnMu sync.Mutex
 	inTxn bool
+
+	// Brokers acquire read lock to be able to produce concurrently while
+	// EndBeginTransaction takes exclusive write lock to block any produces.
+	// This lock is required to not allow any produce requests be written while
+	// we are in the process of ending transaction and starting a new one.
+	txnRollMu sync.RWMutex
 }
 
 // BufferedProduceRecords returns the number of records currently buffered for
